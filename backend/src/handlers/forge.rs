@@ -1,6 +1,5 @@
 use crate::models::{ForgeOutput, ForgeRequest, ForgeStep, AppState, FixRequest, SessionData, TransactionDetails};
-use crate::services::{install_dependencies};
-use crate::utils::run_command_with_output;
+use crate::utils::{run_command_with_output, install_dependencies};
 use axum::{
     extract::{Query, State},
     response::sse::{Event, Sse},
