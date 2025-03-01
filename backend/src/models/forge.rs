@@ -7,8 +7,8 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use crate::processors::LLMImpl;
 use async_openai::types::ChatCompletionRequestUserMessage;
-
-
+use crate::ProtocolGuidelinesProcessor;
+use std::path::PathBuf;
 
 #[derive(Serialize, Debug)]
 pub struct ForgeStep {
@@ -84,6 +84,8 @@ pub struct AppState {
     pub template_generator: Mutex<LLMImpl>,
     pub process_limiter: Arc<Semaphore>,
     pub temp_dirs: Mutex<HashMap<String, TempDir>>,
+    pub protocol_processor: Arc<ProtocolGuidelinesProcessor>,
+    pub base_forge_dir: PathBuf,
 }
 
 #[derive(Deserialize)]

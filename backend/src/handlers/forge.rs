@@ -12,10 +12,10 @@ use uuid::Uuid;
 use tempfile::TempDir;
 use std::path::PathBuf;
 use crate::processors::LLMGenerator;
+use fs_extra::dir::copy;
 
 
-pub 
-async fn fix_forge_process(
+pub async fn fix_forge_process(
     State(state): State<Arc<AppState>>,
     Query(request): Query<FixRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -125,7 +125,6 @@ async fn fix_forge_process(
                             "script/Script.s.sol",
                             "--fork-url",
                             &rpc_url,
-                            "--json",
                             "-vvvv",
                         ])
                         .current_dir(&project_path)
@@ -133,6 +132,17 @@ async fn fix_forge_process(
                         .await
                     {
                         Ok(output) => {
+                            // Log both stdout and stderr for debugging
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            
+                            tx.send(ForgeStep {
+                                title: "Simulating Transactions".to_string(),
+                                output: format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr),
+                            })
+                            .await
+                            .ok();
+
                             // Parse successful output
                             if output.status.success() {
                                 let json_path = project_path
@@ -185,10 +195,9 @@ async fn fix_forge_process(
                                     }
                                 }
                             } else {
-                                let error = String::from_utf8_lossy(&output.stderr);
                                 tx.send(ForgeStep {
                                     title: "Error".to_string(),
-                                    output: error.to_string(),
+                                    output: format!("Forge script failed:\nSTDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr),
                                 })
                                 .await
                                 .ok();
@@ -272,49 +281,11 @@ pub async fn stream_forge_process(
         .await
         .ok();
 
+        // Instead of forge init, copy the base project contents
+        let options = fs_extra::dir::CopyOptions::new()
+            .content_only(true);  // This makes it copy only the contents
 
-        if let Err(e) = run_command_with_output(
-            Command::new("forge")
-                .args(&["init"])
-                .current_dir(temp_dir.as_path()),
-            &tx,
-            |line| ForgeStep {
-                title: "Installing Dependencies".to_string(),
-                output: line,
-            },
-        )
-        .await
-        {
-            tx.send(ForgeStep {
-                title: "Error".to_string(),
-                output: e.to_string(),
-            })
-            .await
-            .ok();
-            return;
-        }
-
-        // Add status update for git init
-        tx.send(ForgeStep {
-            title: "Installing Dependencies".to_string(),
-            output: "Initializing git repository...".to_string(),
-        })
-        .await
-        .ok();
-
-        // Initialize git submodules
-        if let Err(e) = run_command_with_output(
-            Command::new("git")
-                .args(&["submodule", "init"])
-                .current_dir(temp_dir.as_path()),
-            &tx,
-            |line| ForgeStep {
-                title: "Installing Dependencies".to_string(),
-                output: line,
-            },
-        )
-        .await
-        {
+        if let Err(e) = fs_extra::dir::copy(&state.base_forge_dir, &temp_dir, &options) {
             tx.send(ForgeStep {
                 title: "Error".to_string(),
                 output: e.to_string(),
@@ -328,21 +299,29 @@ pub async fn stream_forge_process(
 
         let mut generator = state.template_generator.lock().await;
 
+        let guidelines = state.protocol_processor.get_guideline(&*generator, &request.intent).await.unwrap();
+
+
+        // read remappings.txt
+        let remappings = fs::read_to_string(temp_dir.as_path().join("remappings.txt")).unwrap();
+
         // Generate code
         match generator
             .generate_forge_code(
                 &request.from_address,
                 &request.intent,
-                &mut messages,
+                &guidelines,
+                &remappings,
+                &mut messages,  
                 tx.clone(), // Pass the sender to allow progress updates
             )
             .await
         {
             Ok(forge_code) => {
-                // Send update before parsing install commands
+                                // Send update before parsing install commands
                 tx.send(ForgeStep {
-                    title: "Installing Dependencies".to_string(),
-                    output: "Parsing dependencies...".to_string() + "\n",
+                    title: "Generating Code".to_string(),
+                    output: "Saving session...".to_string() + "\n",
                 })
                 .await
                 .ok();
@@ -356,83 +335,6 @@ pub async fn stream_forge_process(
                     tx.send(ForgeStep {
                         title: "Error".to_string(),
                         output: e.to_string(),
-                    })
-                    .await
-                    .ok();
-                    return;
-                }
-
-                if let Some(install_commands) = forge_code
-                    .split("```")
-                    .find(|s| s.trim().starts_with("sh") && s.contains("forge install"))
-                    .and_then(|s| s.strip_prefix("sh\n"))
-                    .map(|s| {
-                        s.lines()
-                            .filter(|line| line.trim().starts_with("forge install"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                {
-                    for cmd in install_commands.lines() {
-                        if cmd.starts_with("forge install") {
-                            let parts: Vec<&str> = cmd.split_whitespace().collect();
-                            if parts.len() < 3 {
-                                continue;
-                            }
-
-                            let repo = parts[2].to_lowercase();
-                            // Send update before each dependency installation
-                            tx.send(ForgeStep {
-                                title: "Installing Dependencies".to_string(),
-                                output: repo.clone() + "\n",
-                            })
-                            .await
-                            .ok();
-
-                            if let Err(e) = run_command_with_output(
-                                Command::new("forge")
-                                    .arg("install")
-                                    .arg(&repo)
-                                    .arg("--no-commit")
-                                    .current_dir(&project_path),
-                                &tx,
-                                |line| ForgeStep {
-                                    title: "Installing Dependencies".to_string(),
-                                    output: line + "\n",
-                                },
-                            )
-                            .await
-                            {
-                                tx.send(ForgeStep {
-                                    title: "Error".to_string(),
-                                    output: format!("Failed to install {}: {}", repo, e),
-                                })
-                                .await
-                                .ok();
-                                return;
-                            }
-
-                            let lib_name = repo.split('/').last().unwrap_or(&repo);
-                            if let Err(e) =
-                                install_dependencies(&project_path, lib_name, tx.clone()).await
-                            {
-                                tx.send(ForgeStep {
-                                    title: "Error".to_string(),
-                                    output: format!(
-                                        "Failed to install dependencies for {}: {}",
-                                        lib_name, e
-                                    ),
-                                })
-                                .await
-                                .ok();
-                                return;
-                            }
-                        }
-                    }
-                } else {
-                    tx.send(ForgeStep {
-                        title: "Error".to_string(),
-                        output: "No install commands found in generated code".to_string(),
                     })
                     .await
                     .ok();
@@ -457,6 +359,32 @@ pub async fn stream_forge_process(
                         return;
                     }
                 };
+
+                tx.send(ForgeStep {
+                    title: "Writing Code".to_string(),
+                    output: "Writing code...".to_string() + "\n",
+                })
+                .await
+                .ok();
+
+                // List files in temp directory
+                let files = match fs::read_dir(temp_dir.as_path()) {
+                    Ok(entries) => {
+                        let paths: Vec<_> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .collect();
+                        format!("Files in directory:\n{:#?}", paths)
+                    },
+                    Err(e) => format!("Error reading directory: {}", e)
+                };
+
+                tx.send(ForgeStep {
+                    title: "Directory Contents".to_string(), 
+                    output: files,
+                })
+                .await
+                .ok();
 
                 // Write and compile code
                 let script_path = temp_dir.as_path().join("script").join("Script.s.sol");
@@ -488,7 +416,6 @@ pub async fn stream_forge_process(
                         "script/Script.s.sol",
                         "--fork-url",
                         &rpc_url,
-                        "--json",
                         "-vvvv",
                     ])
                     .current_dir(&project_path)
@@ -496,6 +423,17 @@ pub async fn stream_forge_process(
                     .await
                 {
                     Ok(output) => {
+                        // Log both stdout and stderr for debugging
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        
+                        tx.send(ForgeStep {
+                            title: "Simulating Transactions".to_string(),
+                            output: format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr),
+                        })
+                        .await
+                        .ok();
+
                         // Parse successful output
                         if output.status.success() {
                             let json_path = project_path
@@ -535,6 +473,7 @@ pub async fn stream_forge_process(
                                         })
                                         .await
                                         .ok();
+                                        return;
                                     }
                                 } else {
                                     tx.send(ForgeStep {
@@ -543,13 +482,13 @@ pub async fn stream_forge_process(
                                     })
                                     .await
                                     .ok();
+                                    return;
                                 }
                             }
                         } else {
-                            let error = String::from_utf8_lossy(&output.stderr);
                             tx.send(ForgeStep {
                                 title: "Error".to_string(),
-                                output: error.to_string(),
+                                output: format!("Forge script failed:\nSTDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr),
                             })
                             .await
                             .ok();
@@ -589,7 +528,7 @@ pub async fn stream_forge_process(
 
 
 fn create_forge_stream(
-    rx: tokio::sync::mpsc::Receiver<ForgeStep>
+    mut rx: tokio::sync::mpsc::Receiver<ForgeStep>
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     Sse::new(stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
@@ -597,7 +536,13 @@ fn create_forge_stream(
                 let event = Event::default().data(serde_json::to_string(&step).unwrap());
                 Some((Ok(event), rx))
             }
-            None => None
+            None => {
+                // Send a final "close" event before ending the stream
+                let event = Event::default()
+                    .event("close")
+                    .data("stream complete");
+                Some((Ok(event), rx))
+            }
         }
     }))
 }

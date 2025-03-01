@@ -5,6 +5,7 @@ use eyre::Result;
 use tokio::sync::mpsc::Sender;
 use std::path::PathBuf;
 use crate::models::ForgeStep;
+mod protocol_guidelines;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TemplatePattern {
@@ -22,6 +23,8 @@ pub trait LLMGenerator {
         &mut self,
         address: &str,
         intent: &str,
+        guidelines: &str,
+        remappings: &str,
         messages: &mut Vec<ChatCompletionRequestUserMessage>,
         tx: Sender<ForgeStep>,
     ) -> Result<String>;
@@ -33,6 +36,8 @@ pub trait LLMGenerator {
         tx: Sender<ForgeStep>,
     ) -> Result<String>;
     async fn chat_stream(&self, messages: &[ChatCompletionRequestUserMessage], tx: Sender<ForgeStep>) -> Result<String>;
+
+    async fn generate(&self, messages: &mut Vec<ChatCompletionRequestUserMessage>) -> Result<String>;
 
 }
 
@@ -49,11 +54,13 @@ impl LLMGenerator for LLMImpl {
         &mut self,
         address: &str,
         intent: &str,
+        guidelines: &str,
+        remappings: &str,
         messages: &mut Vec<ChatCompletionRequestUserMessage>,
         tx: Sender<ForgeStep>,
     ) -> Result<String> {
         match self {
-            LLMImpl::Heurist(llm) => llm.generate_forge_code(address, intent, messages, tx).await,
+            LLMImpl::Heurist(llm) => llm.generate_forge_code(address, intent, guidelines, remappings, messages, tx).await,
         }
     }
     
@@ -78,9 +85,17 @@ impl LLMGenerator for LLMImpl {
         }
     }
 
+    async fn generate(&self, messages: &mut Vec<ChatCompletionRequestUserMessage>) -> Result<String> {
+        match self {
+            LLMImpl::Heurist(llm) => llm.generate( messages).await,
+        }
+    }
+
 }
 
 pub use heurist_llm::LLMTemplateGenerator as HeuristLLM;
+
+pub use protocol_guidelines::ProtocolGuidelinesProcessor;
 
 // pub fn extract_source_code(source_code: &str) -> Result<String> {
 //     // Handle standard JSON format
